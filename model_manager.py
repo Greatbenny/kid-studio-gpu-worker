@@ -21,9 +21,9 @@ MODEL_REGISTRY: Dict[str, ModelSpec] = {
     ),
     "latentsync": ModelSpec(
         key="latentsync",
-        family="LatentSync 1.6",
+        family="LatentSync 1.6 512px",
         purpose="lip_sync",
-        implemented=False,
+        implemented=True,
     ),
 }
 
@@ -81,6 +81,10 @@ class ModelManager:
                 from engines.ltx_engine import LTXEngine
 
                 self._engine = LTXEngine()
+            elif key == "latentsync":
+                from engines.latentsync_engine import LatentSyncEngine
+
+                self._engine = LatentSyncEngine()
             else:
                 raise NotImplementedError(f"Model loader not implemented: {key}")
 
