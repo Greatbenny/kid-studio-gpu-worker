@@ -1,24 +1,35 @@
 import os
-import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import imageio
+import numpy as np
 import requests
+import torch
+from huggingface_hub import hf_hub_download
+
+from ltx_video.inference import (
+    calculate_padding,
+    create_latent_upsampler,
+    create_ltx_video_pipeline,
+    get_device,
+    get_total_gpu_memory,
+    get_unique_filename,
+    load_pipeline_config,
+    prepare_conditioning,
+    seed_everething,
+)
+from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline
+from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 
 
 class LTXEngine:
-    """LTX 13B distilled video generation wrapper.
-
-    The worker image contains a pinned checkout of the official LTX-Video
-    repository. This wrapper validates that runtime, resolves remote
-    conditioning assets to local files, invokes the official inference entry
-    point, and returns the generated MP4 path.
-
-    Generation is only performed when generate() is explicitly called.
-    """
+    """Resident LTX 13B distilled BF16 engine for Kid Studio shots."""
 
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self.ltx_root = Path(os.getenv("LTX_ROOT", "/opt/LTX-Video"))
         self.config_path = Path(
             os.getenv(
@@ -26,13 +37,63 @@ class LTXEngine:
                 str(self.ltx_root / "configs" / "ltxv-13b-0.9.8-distilled.yaml"),
             )
         )
-        self.python = os.getenv("LTX_PYTHON", "python3")
-        self.inference_script = self.ltx_root / "inference.py"
-
-        if not self.inference_script.exists():
-            raise RuntimeError(f"LTX inference script not found: {self.inference_script}")
         if not self.config_path.exists():
             raise RuntimeError(f"LTX pipeline config not found: {self.config_path}")
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA GPU is required to load LTX")
+
+        self.device = get_device()
+        self.pipeline_config = load_pipeline_config(str(self.config_path))
+
+        checkpoint_name = self.pipeline_config["checkpoint_path"]
+        if os.path.isfile(checkpoint_name):
+            checkpoint_path = checkpoint_name
+        else:
+            checkpoint_path = hf_hub_download(
+                repo_id="Lightricks/LTX-Video",
+                filename=checkpoint_name,
+                repo_type="model",
+            )
+
+        upscaler_name = self.pipeline_config.get("spatial_upscaler_model_path")
+        if upscaler_name and os.path.isfile(upscaler_name):
+            upscaler_path = upscaler_name
+        elif upscaler_name:
+            upscaler_path = hf_hub_download(
+                repo_id="Lightricks/LTX-Video",
+                filename=upscaler_name,
+                repo_type="model",
+            )
+        else:
+            upscaler_path = None
+
+        precision = self.pipeline_config["precision"]
+        text_encoder = self.pipeline_config["text_encoder_model_name_or_path"]
+        sampler = self.pipeline_config.get("sampler")
+
+        # Kid Studio already produces detailed deterministic prompts. Disable
+        # LTX prompt-enhancer models to save VRAM and prevent prompt rewriting.
+        pipeline = create_ltx_video_pipeline(
+            ckpt_path=checkpoint_path,
+            precision=precision,
+            text_encoder_model_name_or_path=text_encoder,
+            sampler=sampler,
+            device=self.device,
+            enhance_prompt=False,
+        )
+
+        if self.pipeline_config.get("pipeline_type") == "multi-scale":
+            if not upscaler_path:
+                raise RuntimeError("LTX multi-scale config requires the spatial upscaler")
+            latent_upsampler = create_latent_upsampler(upscaler_path, pipeline.device)
+            pipeline = LTXMultiScalePipeline(
+                pipeline,
+                latent_upsampler=latent_upsampler,
+            )
+
+        self.pipeline = pipeline
+        self.precision = precision
+        self.loaded = True
 
     @staticmethod
     def _download(url: str, destination: Path) -> Path:
@@ -66,127 +127,185 @@ class LTXEngine:
 
         return resolved
 
+    @staticmethod
+    def _skip_strategy(stg_mode: str) -> SkipLayerStrategy:
+        mode = str(stg_mode or "attention_values").lower()
+        if mode in {"stg_av", "attention_values"}:
+            return SkipLayerStrategy.AttentionValues
+        if mode in {"stg_as", "attention_skip"}:
+            return SkipLayerStrategy.AttentionSkip
+        if mode in {"stg_r", "residual"}:
+            return SkipLayerStrategy.Residual
+        if mode in {"stg_t", "transformer_block"}:
+            return SkipLayerStrategy.TransformerBlock
+        raise ValueError(f"Invalid LTX spatiotemporal guidance mode: {stg_mode}")
+
     def generate(self, data: Dict[str, object]) -> Dict[str, object]:
-        prompt = str(data.get("prompt") or "").strip()
-        if not prompt:
-            raise ValueError("Missing required input: prompt")
+        with self._lock:
+            if not self.loaded or self.pipeline is None:
+                raise RuntimeError("LTX engine is not loaded")
 
-        width = int(data.get("width") or 768)
-        height = int(data.get("height") or 512)
-        num_frames = int(data.get("num_frames") or 121)
-        frame_rate = int(data.get("frame_rate") or 24)
-        seed = int(data.get("seed") or 171198)
-        negative_prompt = str(
-            data.get("negative_prompt")
-            or "worst quality, inconsistent motion, blurry, jittery, distorted"
-        )
+            prompt = str(data.get("prompt") or "").strip()
+            if not prompt:
+                raise ValueError("Missing required input: prompt")
 
-        if width <= 0 or height <= 0 or num_frames <= 0 or frame_rate <= 0:
-            raise ValueError("width, height, num_frames and frame_rate must be positive")
-
-        output_root = Path(
-            str(data.get("output_dir") or os.getenv("KID_STUDIO_OUTPUT_PATH", "/workspace/outputs"))
-        )
-        output_root.mkdir(parents=True, exist_ok=True)
-
-        with tempfile.TemporaryDirectory(prefix="kid-studio-ltx-") as temp_name:
-            temp_dir = Path(temp_name)
-            conditioning = self._resolve_conditioning_media(
-                data.get("conditioning_media_paths") or [],
-                data.get("conditioning_media_urls") or [],
-                temp_dir,
+            width = int(data.get("width") or 768)
+            height = int(data.get("height") or 512)
+            num_frames = int(data.get("num_frames") or 121)
+            frame_rate = int(data.get("frame_rate") or 24)
+            seed = int(data.get("seed") or 171198)
+            negative_prompt = str(
+                data.get("negative_prompt")
+                or "worst quality, inconsistent motion, blurry, jittery, distorted"
             )
 
-            start_frames = [int(value) for value in (data.get("conditioning_start_frames") or [])]
-            strengths = [float(value) for value in (data.get("conditioning_strengths") or [])]
+            if width <= 0 or height <= 0 or num_frames <= 0 or frame_rate <= 0:
+                raise ValueError("width, height, num_frames and frame_rate must be positive")
 
-            if conditioning and not start_frames:
-                start_frames = [0] * len(conditioning)
-            if conditioning and len(start_frames) != len(conditioning):
-                raise ValueError(
-                    "conditioning_start_frames must match the number of conditioning media items"
+            output_root = Path(
+                str(
+                    data.get("output_dir")
+                    or os.getenv("KID_STUDIO_OUTPUT_PATH", "/workspace/outputs")
                 )
-            if strengths and len(strengths) != len(conditioning):
-                raise ValueError(
-                    "conditioning_strengths must match the number of conditioning media items"
-                )
-
-            before = {path.resolve() for path in output_root.rglob("*.mp4")}
-
-            command = [
-                self.python,
-                str(self.inference_script),
-                "--prompt",
-                prompt,
-                "--pipeline_config",
-                str(self.config_path),
-                "--output_path",
-                str(output_root),
-                "--width",
-                str(width),
-                "--height",
-                str(height),
-                "--num_frames",
-                str(num_frames),
-                "--frame_rate",
-                str(frame_rate),
-                "--seed",
-                str(seed),
-                "--negative_prompt",
-                negative_prompt,
-            ]
-
-            if bool(data.get("offload_to_cpu", False)):
-                command.extend(["--offload_to_cpu", "true"])
-
-            if conditioning:
-                command.append("--conditioning_media_paths")
-                command.extend(conditioning)
-                command.append("--conditioning_start_frames")
-                command.extend(str(value) for value in start_frames)
-                if strengths:
-                    command.append("--conditioning_strengths")
-                    command.extend(str(value) for value in strengths)
-
-            completed = subprocess.run(
-                command,
-                cwd=str(self.ltx_root),
-                capture_output=True,
-                text=True,
-                timeout=int(data.get("timeout_seconds") or 7200),
-                check=False,
             )
+            output_root.mkdir(parents=True, exist_ok=True)
 
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    "LTX generation failed: "
-                    + (completed.stderr[-6000:] or completed.stdout[-6000:] or "unknown error")
+            with tempfile.TemporaryDirectory(prefix="kid-studio-ltx-") as temp_name:
+                temp_dir = Path(temp_name)
+                conditioning = self._resolve_conditioning_media(
+                    data.get("conditioning_media_paths") or [],
+                    data.get("conditioning_media_urls") or [],
+                    temp_dir,
                 )
 
-            after = [path.resolve() for path in output_root.rglob("*.mp4")]
-            generated = [path for path in after if path not in before]
-            if not generated:
-                raise RuntimeError(
-                    "LTX completed without exposing a new MP4 in the configured output directory"
+                start_frames = [
+                    int(value) for value in (data.get("conditioning_start_frames") or [])
+                ]
+                strengths = [
+                    float(value) for value in (data.get("conditioning_strengths") or [])
+                ]
+
+                if conditioning and not start_frames:
+                    start_frames = [0] * len(conditioning)
+                if conditioning and not strengths:
+                    strengths = [1.0] * len(conditioning)
+                if len(start_frames) != len(conditioning):
+                    raise ValueError(
+                        "conditioning_start_frames must match conditioning media count"
+                    )
+                if len(strengths) != len(conditioning):
+                    raise ValueError(
+                        "conditioning_strengths must match conditioning media count"
+                    )
+                if any(value < 0 or value >= num_frames for value in start_frames):
+                    raise ValueError("conditioning_start_frames must fall inside the shot")
+                if any(value < 0 or value > 1 for value in strengths):
+                    raise ValueError("conditioning strengths must be between 0 and 1")
+
+                height_padded = ((height - 1) // 32 + 1) * 32
+                width_padded = ((width - 1) // 32 + 1) * 32
+                num_frames_padded = ((num_frames - 2) // 8 + 1) * 8 + 1
+                padding = calculate_padding(
+                    height,
+                    width,
+                    height_padded,
+                    width_padded,
                 )
 
-            generated.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-            output_path = generated[0]
+                seed_everething(seed)
+                offload_requested = bool(data.get("offload_to_cpu", False))
+                offload_to_cpu = offload_requested and get_total_gpu_memory() < 30
 
-            return {
-                "ok": True,
-                "engine": "ltx",
-                "model": "LTX-Video 13B 0.9.8 distilled BF16",
-                "output_path": str(output_path),
-                "size_bytes": output_path.stat().st_size,
-                "width": width,
-                "height": height,
-                "num_frames": num_frames,
-                "frame_rate": frame_rate,
-                "seed": seed,
-                "conditioning_count": len(conditioning),
-                "stdout_tail": completed.stdout[-2000:],
-            }
+                conditioning_items = (
+                    prepare_conditioning(
+                        conditioning_media_paths=conditioning,
+                        conditioning_strengths=strengths,
+                        conditioning_start_frames=start_frames,
+                        height=height,
+                        width=width,
+                        num_frames=num_frames,
+                        padding=padding,
+                        pipeline=self.pipeline,
+                    )
+                    if conditioning
+                    else None
+                )
+
+                call_config = dict(self.pipeline_config)
+                stg_mode = call_config.pop("stg_mode", "attention_values")
+                skip_layer_strategy = self._skip_strategy(stg_mode)
+
+                generator = torch.Generator(device=self.device).manual_seed(seed)
+                images = self.pipeline(
+                    **call_config,
+                    skip_layer_strategy=skip_layer_strategy,
+                    generator=generator,
+                    output_type="pt",
+                    callback_on_step_end=None,
+                    height=height_padded,
+                    width=width_padded,
+                    num_frames=num_frames_padded,
+                    frame_rate=frame_rate,
+                    prompt=prompt,
+                    prompt_attention_mask=None,
+                    negative_prompt=negative_prompt,
+                    negative_prompt_attention_mask=None,
+                    media_items=None,
+                    conditioning_items=conditioning_items,
+                    is_video=True,
+                    vae_per_channel_normalize=True,
+                    image_cond_noise_scale=float(data.get("image_cond_noise_scale") or 0.15),
+                    mixed_precision=(self.precision == "mixed_precision"),
+                    offload_to_cpu=offload_to_cpu,
+                    device=self.device,
+                    enhance_prompt=False,
+                ).images
+
+                pad_left, pad_right, pad_top, pad_bottom = padding
+                crop_bottom = -pad_bottom if pad_bottom else images.shape[3]
+                crop_right = -pad_right if pad_right else images.shape[4]
+                images = images[
+                    :, :, :num_frames, pad_top:crop_bottom, pad_left:crop_right
+                ]
+
+                video_np = images[0].permute(1, 2, 3, 0).cpu().float().numpy()
+                video_np = (video_np * 255).astype(np.uint8)
+                output_path = get_unique_filename(
+                    "video_output_0",
+                    ".mp4",
+                    prompt=prompt,
+                    seed=seed,
+                    resolution=(height, width, num_frames),
+                    dir=output_root,
+                )
+
+                with imageio.get_writer(output_path, fps=frame_rate) as video:
+                    for frame in video_np:
+                        video.append_data(frame)
+
+                del images
+                del video_np
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                return {
+                    "ok": True,
+                    "engine": "ltx",
+                    "model": "LTX-Video 13B 0.9.8 distilled BF16",
+                    "resident_pipeline": True,
+                    "output_path": str(output_path),
+                    "size_bytes": output_path.stat().st_size,
+                    "width": width,
+                    "height": height,
+                    "num_frames": num_frames,
+                    "frame_rate": frame_rate,
+                    "seed": seed,
+                    "conditioning_count": len(conditioning),
+                }
 
     def close(self) -> None:
-        return None
+        with self._lock:
+            self.loaded = False
+            self.pipeline = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
