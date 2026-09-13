@@ -8,7 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LTX_ROOT=/opt/LTX-Video \
     LTX_CONFIG=/opt/LTX-Video/configs/ltxv-13b-0.9.8-distilled.yaml \
     LATENTSYNC_ROOT=/opt/LatentSync \
-    LATENTSYNC_CONFIG=/opt/LatentSync/configs/unet/stage2.yaml
+    LATENTSYNC_CONFIG=/opt/LatentSync/configs/unet/stage2_512.yaml
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev git ffmpeg curl ca-certificates libgl1 libglib2.0-0 \
