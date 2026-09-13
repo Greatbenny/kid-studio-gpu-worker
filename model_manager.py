@@ -15,13 +15,13 @@ class ModelSpec:
 MODEL_REGISTRY: Dict[str, ModelSpec] = {
     "ltx": ModelSpec(
         key="ltx",
-        family="LTX-Video",
+        family="LTX-Video 13B 0.9.8 distilled BF16",
         purpose="video_generation",
-        implemented=False,
+        implemented=True,
     ),
     "latentsync": ModelSpec(
         key="latentsync",
-        family="LatentSync",
+        family="LatentSync 1.6",
         purpose="lip_sync",
         implemented=False,
     ),
@@ -37,6 +37,10 @@ class ModelManager:
     @property
     def model_key(self) -> Optional[str]:
         return self._model_key
+
+    @property
+    def engine(self) -> Optional[Any]:
+        return self._engine
 
     def status(self) -> Dict[str, object]:
         with self._lock:
@@ -64,10 +68,7 @@ class ModelManager:
                 "ok": False,
                 "loaded": False,
                 "model": key,
-                "message": (
-                    f"{spec.family} is registered but inference loading is not enabled yet. "
-                    "This foundation build performs no paid/generative work."
-                ),
+                "message": f"{spec.family} is registered but inference loading is not enabled yet.",
             }
 
         with self._lock:
@@ -75,7 +76,29 @@ class ModelManager:
                 return {"ok": True, "loaded": True, "model": key, "reused": True}
 
             self.unload()
-            raise NotImplementedError(f"Model loader not implemented: {key}")
+
+            if key == "ltx":
+                from engines.ltx_engine import LTXEngine
+
+                self._engine = LTXEngine()
+            else:
+                raise NotImplementedError(f"Model loader not implemented: {key}")
+
+            self._model_key = key
+            return {
+                "ok": True,
+                "loaded": True,
+                "model": key,
+                "family": spec.family,
+                "reused": False,
+            }
+
+    def require_engine(self, model_key: str) -> Any:
+        key = str(model_key or "").strip().lower()
+        with self._lock:
+            if self._model_key != key or self._engine is None:
+                self.load(key)
+            return self._engine
 
     def unload(self) -> Dict[str, object]:
         with self._lock:
