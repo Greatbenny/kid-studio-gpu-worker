@@ -1,0 +1,24 @@
+name: Stretchy CPU POC
+
+on:
+  push:
+    branches: [cpu-2d5-stretchy-poc]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install dependencies
+        run: pip install -r poc/stretchy_cpu/requirements.txt
+      - name: Syntax check
+        run: python -m py_compile poc/stretchy_cpu/stretchy_cpu.py poc/stretchy_cpu/test_stretchy_cpu.py
+      - name: CPU renderer test
+        working-directory: poc/stretchy_cpu
+        run: python test_stretchy_cpu.py
