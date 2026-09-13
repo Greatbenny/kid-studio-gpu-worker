@@ -6,10 +6,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUNPOD_VOLUME_PATH=/runpod-volume \
     LOCAL_CACHE_PATH=/workspace/kid-studio-cache \
     LTX_ROOT=/opt/LTX-Video \
-    LTX_CONFIG=/opt/LTX-Video/configs/ltxv-13b-0.9.8-distilled.yaml
+    LTX_CONFIG=/opt/LTX-Video/configs/ltxv-13b-0.9.8-distilled.yaml \
+    LATENTSYNC_ROOT=/opt/LatentSync \
+    LATENTSYNC_CONFIG=/opt/LatentSync/configs/unet/stage2.yaml
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-dev git ffmpeg curl ca-certificates \
+    python3 python3-pip python3-dev git ffmpeg curl ca-certificates libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -26,6 +28,12 @@ RUN git clone https://github.com/Lightricks/LTX-Video.git ${LTX_ROOT} && \
     cd ${LTX_ROOT} && \
     git checkout 5260738e171955b66c0827f9af7e84d68fd1d919 && \
     python3 -m pip install -e '.[inference]'
+
+# Pin LatentSync 1.6 inference code. Its dependency set is installed from this
+# worker's requirements.txt so LTX and LatentSync share one compatible runtime.
+RUN git clone https://github.com/bytedance/LatentSync.git ${LATENTSYNC_ROOT} && \
+    cd ${LATENTSYNC_ROOT} && \
+    git checkout a229c3948406bc2cf6eaf4873e662e70c6a04746
 
 COPY . .
 
