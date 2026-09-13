@@ -28,6 +28,33 @@ Initial target stack:
 
 The first implementation is intentionally non-generative. LTX and LatentSync execution endpoints will be added after the worker lifecycle and persistent-storage behavior are verified on a GPU Pod.
 
+## Storage behavior
+
+The worker prefers the RunPod network volume when `/runpod-volume` exists and is writable. If it is missing, the worker falls back to `/workspace/kid-studio-cache` instead of failing startup.
+
+This makes the network volume a cache rather than a hard dependency. A missing or expired volume can be rebuilt from the pinned model manifest.
+
+## Model recovery
+
+Pinned models:
+
+- LTX: `Lightricks/LTX-Video`, `ltxv-13b-0.9.8-distilled-fp8`
+- LatentSync: `ByteDance/LatentSync-1.6`
+
+Restore a model into the currently selected cache root:
+
+```bash
+python3 bootstrap_models.py ltx
+```
+
+or:
+
+```bash
+python3 bootstrap_models.py latentsync
+```
+
+Where known, SHA256 checksums are verified after download.
+
 ## Environment
 
 - `RUNPOD_VOLUME_PATH` default: `/runpod-volume`
