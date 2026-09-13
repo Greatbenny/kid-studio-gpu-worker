@@ -1,0 +1,25 @@
+name: Python Syntax
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile worker sources
+        run: |
+          python -m py_compile \
+            worker.py \
+            model_manager.py \
+            model_manifest.py \
+            storage.py \
+            bootstrap_models.py \
+            engines/ltx_engine.py \
+            engines/latentsync_engine.py
