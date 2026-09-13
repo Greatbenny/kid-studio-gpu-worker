@@ -19,17 +19,15 @@ class ModelManifest:
 MODEL_MANIFESTS: Dict[str, ModelManifest] = {
     "ltx": ModelManifest(
         key="ltx",
-        version="13b-0.9.8-distilled-fp8",
+        version="13b-0.9.8-distilled-bf16",
         artifacts=(
             ModelArtifact(
                 repo_id="Lightricks/LTX-Video",
-                filename="ltxv-13b-0.9.8-distilled-fp8.safetensors",
-                sha256="111a3d07baa17f520e98b571e7916139ae0865c9a24b7534529d6b9e74264db3",
+                filename="ltxv-13b-0.9.8-distilled.safetensors",
             ),
             ModelArtifact(
                 repo_id="Lightricks/LTX-Video",
                 filename="ltxv-spatial-upscaler-0.9.8.safetensors",
-                sha256="5b076031c6f860db9037a54f3bb819f10bfb5532ea26a6d30062292428a0c208",
             ),
         ),
     ),
