@@ -9,7 +9,7 @@ from storage import configure_cache_environment, storage_status
 
 
 CACHE_ENV = configure_cache_environment()
-WORKER_BUILD = "gpu-ltx-v2"
+WORKER_BUILD = "gpu-ltx-latentsync-v3"
 
 app = FastAPI(title="Kid Studio GPU Worker", version=WORKER_BUILD)
 
@@ -33,6 +33,15 @@ class VideoGenerateRequest(BaseModel):
     offload_to_cpu: bool = False
     output_dir: Optional[str] = None
     timeout_seconds: int = 7200
+
+
+class LipSyncRequest(BaseModel):
+    video: str = Field(min_length=1, description="Local path or HTTP(S) URL to raw video")
+    audio: str = Field(min_length=1, description="Local path or HTTP(S) URL to approved dialogue audio")
+    guidance_scale: float = Field(default=1.5, ge=1.0, le=3.0)
+    inference_steps: int = Field(default=20, ge=20, le=50)
+    seed: int = 1247
+    output_dir: Optional[str] = None
 
 
 def gpu_status() -> Dict[str, object]:
@@ -90,7 +99,8 @@ def health() -> Dict[str, object]:
         "models": model_manager.status(),
         "generation_enabled": True,
         "video_engine": "ltx",
-        "lip_sync_enabled": False,
+        "lip_sync_enabled": True,
+        "lip_sync_engine": "latentsync-1.6",
     }
 
 
@@ -134,6 +144,21 @@ def generate_video(request: VideoGenerateRequest) -> Dict[str, object]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@app.post("/lipsync")
+def lip_sync(request: LipSyncRequest) -> Dict[str, object]:
+    gpu = gpu_status()
+    if not gpu.get("cuda_available"):
+        raise HTTPException(status_code=503, detail="CUDA GPU is required for LatentSync")
+
+    try:
+        engine = model_manager.require_engine("latentsync")
+        return engine.sync(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/")
 def root() -> Dict[str, object]:
     return {
@@ -141,4 +166,5 @@ def root() -> Dict[str, object]:
         "worker_build": WORKER_BUILD,
         "health": "/health",
         "video_generate": "/video/generate",
+        "lip_sync": "/lipsync",
     }
