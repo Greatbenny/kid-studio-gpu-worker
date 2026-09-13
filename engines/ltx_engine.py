@@ -24,6 +24,9 @@ from ltx_video.inference import (
 from ltx_video.pipelines.pipeline_ltx_video import LTXMultiScalePipeline
 from ltx_video.utils.skip_layer_strategy import SkipLayerStrategy
 
+from model_manifest import MODEL_MANIFESTS
+from storage import select_cache_root
+
 
 class LTXEngine:
     """Resident LTX 13B distilled BF16 engine for Kid Studio shots."""
@@ -44,25 +47,35 @@ class LTXEngine:
 
         self.device = get_device()
         self.pipeline_config = load_pipeline_config(str(self.config_path))
+        manifest = MODEL_MANIFESTS["ltx"]
+        cache_root, _ = select_cache_root()
+        model_dir = cache_root / "models" / "ltx" / manifest.version
+        model_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_name = self.pipeline_config["checkpoint_path"]
-        if os.path.isfile(checkpoint_name):
-            checkpoint_path = checkpoint_name
+        checkpoint_local = model_dir / checkpoint_name
+        if checkpoint_local.exists():
+            checkpoint_path = str(checkpoint_local)
         else:
             checkpoint_path = hf_hub_download(
                 repo_id="Lightricks/LTX-Video",
                 filename=checkpoint_name,
                 repo_type="model",
+                local_dir=str(model_dir),
+                local_dir_use_symlinks=False,
             )
 
         upscaler_name = self.pipeline_config.get("spatial_upscaler_model_path")
-        if upscaler_name and os.path.isfile(upscaler_name):
-            upscaler_path = upscaler_name
+        upscaler_local = model_dir / upscaler_name if upscaler_name else None
+        if upscaler_local and upscaler_local.exists():
+            upscaler_path = str(upscaler_local)
         elif upscaler_name:
             upscaler_path = hf_hub_download(
                 repo_id="Lightricks/LTX-Video",
                 filename=upscaler_name,
                 repo_type="model",
+                local_dir=str(model_dir),
+                local_dir_use_symlinks=False,
             )
         else:
             upscaler_path = None
@@ -93,6 +106,7 @@ class LTXEngine:
 
         self.pipeline = pipeline
         self.precision = precision
+        self.model_dir = model_dir
         self.loaded = True
 
     @staticmethod
@@ -293,6 +307,7 @@ class LTXEngine:
                     "engine": "ltx",
                     "model": "LTX-Video 13B 0.9.8 distilled BF16",
                     "resident_pipeline": True,
+                    "model_dir": str(self.model_dir),
                     "output_path": str(output_path),
                     "size_bytes": output_path.stat().st_size,
                     "width": width,
