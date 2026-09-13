@@ -1,22 +1,38 @@
-import os
 import platform
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from model_manager import model_manager
 from storage import configure_cache_environment, storage_status
 
 
 CACHE_ENV = configure_cache_environment()
-WORKER_BUILD = "gpu-foundation-v1"
+WORKER_BUILD = "gpu-ltx-v2"
 
 app = FastAPI(title="Kid Studio GPU Worker", version=WORKER_BUILD)
 
 
 class ModelLoadRequest(BaseModel):
     model: str
+
+
+class VideoGenerateRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    conditioning_media_paths: List[str] = Field(default_factory=list)
+    conditioning_media_urls: List[str] = Field(default_factory=list)
+    conditioning_start_frames: List[int] = Field(default_factory=list)
+    conditioning_strengths: List[float] = Field(default_factory=list)
+    width: int = 768
+    height: int = 512
+    num_frames: int = 121
+    frame_rate: int = 24
+    seed: int = 171198
+    negative_prompt: Optional[str] = None
+    offload_to_cpu: bool = False
+    output_dir: Optional[str] = None
+    timeout_seconds: int = 7200
 
 
 def gpu_status() -> Dict[str, object]:
@@ -37,8 +53,8 @@ def gpu_status() -> Dict[str, object]:
         if available:
             for index in range(torch.cuda.device_count()):
                 props = torch.cuda.get_device_properties(index)
-                free_bytes: Optional[int] = None
-                total_bytes: Optional[int] = None
+                free_bytes = None
+                total_bytes = None
                 try:
                     free_bytes, total_bytes = torch.cuda.mem_get_info(index)
                 except Exception:
@@ -63,20 +79,18 @@ def gpu_status() -> Dict[str, object]:
 
 @app.get("/health")
 def health() -> Dict[str, object]:
-    storage = storage_status()
-    gpu = gpu_status()
-
     return {
         "ok": True,
         "service": "kid-studio-gpu-worker",
         "worker_build": WORKER_BUILD,
         "hostname": platform.node(),
         "python": platform.python_version(),
-        "storage": storage,
-        "gpu": gpu,
+        "storage": storage_status(),
+        "gpu": gpu_status(),
         "models": model_manager.status(),
-        "safe_mode": True,
-        "generation_enabled": False,
+        "generation_enabled": True,
+        "video_engine": "ltx",
+        "lip_sync_enabled": False,
     }
 
 
@@ -105,10 +119,26 @@ def unload_model() -> Dict[str, object]:
     return model_manager.unload()
 
 
+@app.post("/video/generate")
+def generate_video(request: VideoGenerateRequest) -> Dict[str, object]:
+    gpu = gpu_status()
+    if not gpu.get("cuda_available"):
+        raise HTTPException(status_code=503, detail="CUDA GPU is required for LTX generation")
+
+    try:
+        engine = model_manager.require_engine("ltx")
+        return engine.generate(request.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/")
 def root() -> Dict[str, object]:
     return {
         "service": "kid-studio-gpu-worker",
         "worker_build": WORKER_BUILD,
         "health": "/health",
+        "video_generate": "/video/generate",
     }
