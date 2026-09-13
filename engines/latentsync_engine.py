@@ -23,7 +23,10 @@ class LatentSyncEngine:
         self.torch = torch
         self.root = Path(os.getenv("LATENTSYNC_ROOT", "/opt/LatentSync"))
         self.config_path = Path(
-            os.getenv("LATENTSYNC_CONFIG", str(self.root / "configs/unet/stage2.yaml"))
+            os.getenv(
+                "LATENTSYNC_CONFIG",
+                str(self.root / "configs/unet/stage2_512.yaml"),
+            )
         )
         if not self.root.exists() or not self.config_path.exists():
             raise RuntimeError("Pinned LatentSync source/config is missing from the worker image")
@@ -39,6 +42,7 @@ class LatentSyncEngine:
         self.whisper_path = artifact_paths["whisper/tiny.pt"]
 
         from accelerate.utils import set_seed
+        from DeepCache import DeepCacheSDHelper
         from diffusers import AutoencoderKL, DDIMScheduler
         from omegaconf import OmegaConf
         from latentsync.models.unet import UNet3DConditionModel
@@ -81,6 +85,10 @@ class LatentSyncEngine:
             unet=self.unet,
             scheduler=scheduler,
         ).to("cuda")
+
+        self.deepcache = DeepCacheSDHelper(pipe=self.pipeline)
+        self.deepcache.set_params(cache_interval=3, cache_branch_id=0)
+        self.deepcache.enable()
 
         env = configure_cache_environment()
         self.work_root = Path(env["root"]) / "temp" / "latentsync"
@@ -153,16 +161,24 @@ class LatentSyncEngine:
             return {
                 "ok": True,
                 "engine": "latentsync-1.6",
+                "resolution": int(self.config.data.resolution),
                 "output_path": str(output_path),
                 "size_bytes": output_path.stat().st_size,
                 "seed": seed,
                 "guidance_scale": guidance_scale,
                 "inference_steps": inference_steps,
+                "deepcache": True,
                 "input_audio_preserved": True,
             }
 
     def close(self) -> None:
-        for name in ("pipeline", "unet", "vae", "audio_encoder"):
+        try:
+            if hasattr(self, "deepcache"):
+                self.deepcache.disable()
+        except Exception:
+            pass
+
+        for name in ("deepcache", "pipeline", "unet", "vae", "audio_encoder"):
             if hasattr(self, name):
                 try:
                     delattr(self, name)
